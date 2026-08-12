@@ -271,7 +271,6 @@ namespace ESM26.DualManager
         public DualManagerUI(IntPtr ptr) : base(ptr) { }
 
         private bool _open;
-        private Rect _win = new Rect(80, 80, 560, 520);
         private Vector2 _scroll;
         private string _filter = "";
         private Slots _slots;
@@ -351,13 +350,7 @@ namespace ESM26.DualManager
             if (!_open) return;
             try
             {
-                // GUILayout.Window в IL2CPP опирается на конструктор, которого
-                // в этой версии Unity нет, поэтому рисуем панель напрямую.
-                GUI.Box(_win, "");
-                GUILayout.BeginArea(new Rect(_win.x + 8, _win.y + 8, _win.width - 16, _win.height - 16));
-                GUILayout.Label("ESM26 Dual Manager — две организации в одном мире");
-                DrawWindow(0);
-                GUILayout.EndArea();
+                DrawPanel();
             }
             catch (Exception e)
             {
@@ -366,58 +359,89 @@ namespace ESM26.DualManager
             }
         }
 
-        private void DrawWindow(int id)
+        // Только GUI с явными координатами: GUILayout вырезан из сборки игры
+        // (Unity strip), его вызовы приводят к "Method unstripping failed".
+        private void DrawPanel()
         {
+            const float W = 620f, H = 560f;
+            float x = 60f, y = 60f;
+
+            GUI.Box(new Rect(x, y, W, H), "");
+
+            float cx = x + 12f;
+            float cy = y + 10f;
+            const float LH = 22f;   // высота строки
+            const float BH = 26f;   // высота кнопки
+
+            GUI.Label(new Rect(cx, cy, W - 24f, LH),
+                "ESM26 Dual Manager — две организации в одном мире");
+            cy += LH + 6f;
+
             var current = GameBridge.GetPlayerTeam();
             var currentName = GameBridge.TeamName(current);
 
-            GUILayout.BeginVertical("box");
-            GUILayout.Label($"Сейчас управляете: {currentName}");
-            GUILayout.Label($"Менеджер 1: {(string.IsNullOrEmpty(_slots.OrgA) ? "не выбран" : _slots.OrgA)}" +
-                            (_slots.Current == "A" ? "   ◀ ходит" : ""));
-            GUILayout.Label($"Менеджер 2: {(string.IsNullOrEmpty(_slots.OrgB) ? "не выбран" : _slots.OrgB)}" +
-                            (_slots.Current == "B" ? "   ◀ ходит" : ""));
-            GUILayout.EndVertical();
+            GUI.Label(new Rect(cx, cy, W - 24f, LH), $"Сейчас управляете: {currentName}");
+            cy += LH;
+            GUI.Label(new Rect(cx, cy, W - 24f, LH),
+                $"Менеджер 1: {(string.IsNullOrEmpty(_slots.OrgA) ? "не выбран" : _slots.OrgA)}"
+                + (_slots.Current == "A" ? "   <-- ходит" : ""));
+            cy += LH;
+            GUI.Label(new Rect(cx, cy, W - 24f, LH),
+                $"Менеджер 2: {(string.IsNullOrEmpty(_slots.OrgB) ? "не выбран" : _slots.OrgB)}"
+                + (_slots.Current == "B" ? "   <-- ходит" : ""));
+            cy += LH + 8f;
 
-            GUILayout.BeginHorizontal();
-            if (GUILayout.Button("Назначить менеджера 1")) { _picking = 1; RefreshTeams(); }
-            if (GUILayout.Button("Назначить менеджера 2")) { _picking = 2; RefreshTeams(); }
-            if (GUILayout.Button($"⇄ Передать ход ({DualManagerPlugin.SwapKey.Value})")) SwapTurn();
-            GUILayout.EndHorizontal();
-
-            GUILayout.BeginHorizontal();
-            if (GUILayout.Button("Взять текущую как менеджера 1", GUILayout.Width(240)))
+            float bw = (W - 36f) / 2f;
+            if (GUI.Button(new Rect(cx, cy, bw, BH), "Взять текущую как менеджера 1"))
             {
                 _slots.OrgA = currentName; _slots.Current = "A"; _slots.Save();
                 _status = $"Менеджер 1 = {currentName}";
             }
-            if (GUILayout.Button("Взять текущую как менеджера 2", GUILayout.Width(240)))
+            if (GUI.Button(new Rect(cx + bw + 12f, cy, bw, BH), "Взять текущую как менеджера 2"))
             {
                 _slots.OrgB = currentName; _slots.Save();
                 _status = $"Менеджер 2 = {currentName}";
             }
-            GUILayout.EndHorizontal();
+            cy += BH + 6f;
+
+            float bw3 = (W - 48f) / 3f;
+            if (GUI.Button(new Rect(cx, cy, bw3, BH), "Выбрать оргу менеджера 1"))
+            { _picking = 1; RefreshTeams(); }
+            if (GUI.Button(new Rect(cx + bw3 + 12f, cy, bw3, BH), "Выбрать оргу менеджера 2"))
+            { _picking = 2; RefreshTeams(); }
+            if (GUI.Button(new Rect(cx + (bw3 + 12f) * 2f, cy, bw3, BH),
+                    $"Передать ход ({DualManagerPlugin.SwapKey.Value})"))
+                SwapTurn();
+            cy += BH + 10f;
 
             if (_picking != 0)
             {
-                GUILayout.Space(6);
-                GUILayout.Label($"Выберите организацию для менеджера {_picking}:");
-                GUILayout.BeginHorizontal();
-                GUILayout.Label("Поиск:", GUILayout.Width(50));
-                _filter = GUILayout.TextField(_filter ?? "");
-                if (GUILayout.Button("Отмена", GUILayout.Width(80))) { _picking = 0; _filter = ""; }
-                GUILayout.EndHorizontal();
+                GUI.Label(new Rect(cx, cy, 220f, LH), $"Организация для менеджера {_picking}:");
+                GUI.Label(new Rect(cx + 224f, cy, 50f, LH), "Поиск:");
+                _filter = GUI.TextField(new Rect(cx + 276f, cy, 200f, LH), _filter ?? "");
+                if (GUI.Button(new Rect(cx + 484f, cy, 100f, LH), "Отмена"))
+                { _picking = 0; _filter = ""; }
+                cy += LH + 6f;
 
-                _scroll = GUILayout.BeginScrollView(_scroll, GUILayout.Height(300));
-                int shown = 0;
+                float listH = y + H - cy - 70f;
+                var listRect = new Rect(cx, cy, W - 24f, listH);
+
+                var matches = new List<object>();
                 foreach (var t in _teams)
                 {
                     var nm = GameBridge.TeamName(t);
                     if (!string.IsNullOrEmpty(_filter) &&
                         nm.IndexOf(_filter, StringComparison.OrdinalIgnoreCase) < 0) continue;
-                    if (++shown > 300) break;
+                    matches.Add(t);
+                }
 
-                    if (GUILayout.Button(nm))
+                float rowH = 24f;
+                var viewRect = new Rect(0f, 0f, W - 48f, matches.Count * rowH + 4f);
+                _scroll = GUI.BeginScrollView(listRect, _scroll, viewRect);
+                for (int i = 0; i < matches.Count; i++)
+                {
+                    var nm = GameBridge.TeamName(matches[i]);
+                    if (GUI.Button(new Rect(2f, i * rowH, W - 70f, rowH - 2f), nm))
                     {
                         if (_picking == 1) { _slots.OrgA = nm; _slots.Current = "A"; }
                         else { _slots.OrgB = nm; }
@@ -427,16 +451,17 @@ namespace ESM26.DualManager
                         break;
                     }
                 }
-                GUILayout.EndScrollView();
+                GUI.EndScrollView();
+                cy += listH + 6f;
             }
 
-            GUILayout.Space(4);
-            GUILayout.Label(_status ?? "");
-            GUILayout.Label($"Панель: {DualManagerPlugin.PanelKey.Value}   |   Передача хода: {DualManagerPlugin.SwapKey.Value}");
-
-            GUILayout.BeginHorizontal();
-            if (GUILayout.Button("Закрыть", GUILayout.Width(100))) _open = false;
-            GUILayout.EndHorizontal();
+            float footY = y + H - 58f;
+            GUI.Label(new Rect(cx, footY, W - 24f, LH), _status ?? "");
+            GUI.Label(new Rect(cx, footY + LH, W - 130f, LH),
+                $"Панель: {DualManagerPlugin.PanelKey.Value}   |   Передача хода: {DualManagerPlugin.SwapKey.Value}");
+            if (GUI.Button(new Rect(x + W - 112f, footY + LH - 2f, 100f, BH), "Закрыть"))
+                _open = false;
         }
+
     }
 }
