@@ -346,17 +346,18 @@ namespace ESM26.DualManager
             }
         }
 
-        private Action<int> _windowFn;
-
         private void OnGUI()
         {
             if (!_open) return;
             try
             {
-                _windowFn ??= new Action<int>(DrawWindow);
-                _win = GUILayout.Window(0x00D3A1, _win,
-                    (GUI.WindowFunction)_windowFn,
-                    "ESM26 Dual Manager — две организации в одном мире");
+                // GUILayout.Window в IL2CPP опирается на конструктор, которого
+                // в этой версии Unity нет, поэтому рисуем панель напрямую.
+                GUI.Box(_win, "");
+                GUILayout.BeginArea(new Rect(_win.x + 8, _win.y + 8, _win.width - 16, _win.height - 16));
+                GUILayout.Label("ESM26 Dual Manager — две организации в одном мире");
+                DrawWindow(0);
+                GUILayout.EndArea();
             }
             catch (Exception e)
             {
@@ -433,7 +434,9 @@ namespace ESM26.DualManager
             GUILayout.Label(_status ?? "");
             GUILayout.Label($"Панель: {DualManagerPlugin.PanelKey.Value}   |   Передача хода: {DualManagerPlugin.SwapKey.Value}");
 
-            GUI.DragWindow();
+            GUILayout.BeginHorizontal();
+            if (GUILayout.Button("Закрыть", GUILayout.Width(100))) _open = false;
+            GUILayout.EndHorizontal();
         }
     }
 }
