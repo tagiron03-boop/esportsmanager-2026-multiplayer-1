@@ -8,7 +8,7 @@
     <LangVersion>latest</LangVersion>
     <Nullable>disable</Nullable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-    <NoWarn>$(NoWarn);CS0649;CS0169;CS8981;CS0108</NoWarn>
+    <NoWarn>$(NoWarn);CS0649;CS0169;CS8981;CS0108;CS0436</NoWarn>
     <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
   </PropertyGroup>
 
@@ -22,20 +22,16 @@
   </ItemGroup>
 
   <!--
-    Ссылки на Unity берутся из локальной папки interop, которую BepInEx
-    генерирует при первом запуске игры. Файлы кладутся в папку refs/ репозитория.
+    Подключаются все .dll из папки refs. Это интероп-сборки, которые BepInEx
+    генерирует при первом запуске игры (папка BepInEx\interop).
+    Нужны как минимум:
+      Il2Cppmscorlib.dll
+      UnityEngine.CoreModule.dll
+      UnityEngine.IMGUIModule.dll
+      UnityEngine.InputLegacyModule.dll
   -->
   <ItemGroup>
-    <Reference Include="UnityEngine.CoreModule">
-      <HintPath>refs\UnityEngine.CoreModule.dll</HintPath>
-      <Private>false</Private>
-    </Reference>
-    <Reference Include="UnityEngine.IMGUIModule">
-      <HintPath>refs\UnityEngine.IMGUIModule.dll</HintPath>
-      <Private>false</Private>
-    </Reference>
-    <Reference Include="UnityEngine.InputLegacyModule">
-      <HintPath>refs\UnityEngine.InputLegacyModule.dll</HintPath>
+    <Reference Include="refs\*.dll">
       <Private>false</Private>
     </Reference>
   </ItemGroup>
