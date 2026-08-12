@@ -7,6 +7,7 @@ using BepInEx;
 using BepInEx.Configuration;
 using BepInEx.Logging;
 using BepInEx.Unity.IL2CPP;
+using Il2CppInterop.Runtime.Injection;
 using UnityEngine;
 
 namespace ESM26.DualManager
@@ -18,22 +19,28 @@ namespace ESM26.DualManager
         public const string NAME = "ESM26 Dual Manager";
         public const string VERSION = "1.0.0";
 
-        internal static ManualLogSource Log;
+        internal static ManualLogSource Logger;
         internal static ConfigEntry<KeyCode> PanelKey;
         internal static ConfigEntry<KeyCode> SwapKey;
 
         public override void Load()
         {
-            Log = base.Log;
+            Logger = Log;
 
             PanelKey = Config.Bind("Hotkeys", "PanelKey", KeyCode.F10,
                 "Клавиша открытия панели Dual Manager");
             SwapKey = Config.Bind("Hotkeys", "SwapKey", KeyCode.F11,
                 "Клавиша быстрой передачи хода между менеджерами");
 
-            AddComponent<DualManagerUI>();
+            // В IL2CPP свой MonoBehaviour нужно сначала зарегистрировать в интеропе.
+            ClassInjector.RegisterTypeInIl2Cpp<DualManagerUI>();
 
-            Log.LogInfo($"{NAME} v{VERSION} загружен. Панель: {PanelKey.Value}, передача хода: {SwapKey.Value}");
+            var host = new GameObject("ESM26_DualManager");
+            UnityEngine.Object.DontDestroyOnLoad(host);
+            host.hideFlags = HideFlags.HideAndDontSave;
+            host.AddComponent<DualManagerUI>();
+
+            Logger.LogInfo($"{NAME} v{VERSION} загружен. Панель: {PanelKey.Value}, передача хода: {SwapKey.Value}");
         }
     }
 
@@ -81,7 +88,7 @@ namespace ESM26.DualManager
             }
 
             if (_globalValues == null)
-                DualManagerPlugin.Log.LogWarning("Не найден тип GlobalValues — игра ещё не загрузила данные?");
+                DualManagerPlugin.Logger.LogWarning("Не найден тип GlobalValues — игра ещё не загрузила данные?");
             return _globalValues != null && _dataTeam != null;
         }
 
@@ -128,7 +135,7 @@ namespace ESM26.DualManager
             try { SetValue(m, null, team); return true; }
             catch (Exception e)
             {
-                DualManagerPlugin.Log.LogError($"Не удалось сменить организацию: {e.Message}");
+                DualManagerPlugin.Logger.LogError($"Не удалось сменить организацию: {e.Message}");
                 return false;
             }
         }
@@ -205,7 +212,7 @@ namespace ESM26.DualManager
             }
             catch (Exception e)
             {
-                DualManagerPlugin.Log.LogWarning($"Не удалось перечислить организации: {e.Message}");
+                DualManagerPlugin.Logger.LogWarning($"Не удалось перечислить организации: {e.Message}");
             }
             return false;
         }
@@ -239,7 +246,7 @@ namespace ESM26.DualManager
                     else if (k == "Current") s.Current = v;
                 }
             }
-            catch (Exception e) { DualManagerPlugin.Log.LogWarning($"Чтение настроек: {e.Message}"); }
+            catch (Exception e) { DualManagerPlugin.Logger.LogWarning($"Чтение настроек: {e.Message}"); }
             return s;
         }
 
@@ -254,12 +261,15 @@ namespace ESM26.DualManager
                     "Current=" + Current
                 });
             }
-            catch (Exception e) { DualManagerPlugin.Log.LogWarning($"Запись настроек: {e.Message}"); }
+            catch (Exception e) { DualManagerPlugin.Logger.LogWarning($"Запись настроек: {e.Message}"); }
         }
     }
 
     public class DualManagerUI : MonoBehaviour
     {
+        // Требуется инжектором Il2Cpp для создания управляемой обёртки.
+        public DualManagerUI(IntPtr ptr) : base(ptr) { }
+
         private bool _open;
         private Rect _win = new Rect(80, 80, 560, 520);
         private Vector2 _scroll;
@@ -276,14 +286,21 @@ namespace ESM26.DualManager
 
         private void Update()
         {
-            if (Input.GetKeyDown(DualManagerPlugin.PanelKey.Value))
+            try
             {
-                _open = !_open;
-                if (_open) RefreshTeams();
-            }
+                if (Input.GetKeyDown(DualManagerPlugin.PanelKey.Value))
+                {
+                    _open = !_open;
+                    if (_open) RefreshTeams();
+                }
 
-            if (Input.GetKeyDown(DualManagerPlugin.SwapKey.Value))
-                SwapTurn();
+                if (Input.GetKeyDown(DualManagerPlugin.SwapKey.Value))
+                    SwapTurn();
+            }
+            catch (Exception e)
+            {
+                DualManagerPlugin.Logger.LogError($"Ошибка обработки клавиш: {e}");
+            }
         }
 
         private void RefreshTeams()
@@ -299,7 +316,7 @@ namespace ESM26.DualManager
             if (string.IsNullOrEmpty(_slots.OrgA) || string.IsNullOrEmpty(_slots.OrgB))
             {
                 _status = "Сначала назначьте обе организации в панели.";
-                DualManagerPlugin.Log.LogInfo(_status);
+                DualManagerPlugin.Logger.LogInfo(_status);
                 return;
             }
 
@@ -312,7 +329,7 @@ namespace ESM26.DualManager
             if (team == null)
             {
                 _status = $"Организация «{target}» не найдена в текущем мире.";
-                DualManagerPlugin.Log.LogWarning(_status);
+                DualManagerPlugin.Logger.LogWarning(_status);
                 return;
             }
 
@@ -321,7 +338,7 @@ namespace ESM26.DualManager
                 _slots.Current = _slots.Current == "A" ? "B" : "A";
                 _slots.Save();
                 _status = $"Ход передан: играет {target}";
-                DualManagerPlugin.Log.LogInfo(_status);
+                DualManagerPlugin.Logger.LogInfo(_status);
             }
             else
             {
@@ -329,11 +346,23 @@ namespace ESM26.DualManager
             }
         }
 
+        private Action<int> _drawWindowCached;
+
         private void OnGUI()
         {
             if (!_open) return;
-            _win = GUILayout.Window(0x00D3A1, _win, (GUI.WindowFunction)DrawWindow,
-                "ESM26 Dual Manager — две организации в одном мире");
+            try
+            {
+                _drawWindowCached ??= DrawWindow;
+                _win = GUILayout.Window(0x00D3A1, _win,
+                    (GUI.WindowFunction)_drawWindowCached,
+                    "ESM26 Dual Manager — две организации в одном мире");
+            }
+            catch (Exception e)
+            {
+                DualManagerPlugin.Logger.LogError($"Ошибка отрисовки панели: {e}");
+                _open = false;
+            }
         }
 
         private void DrawWindow(int id)
