@@ -346,16 +346,16 @@ namespace ESM26.DualManager
             }
         }
 
-        private Action<int> _drawWindowCached;
+        private Action<int> _windowFn;
 
         private void OnGUI()
         {
             if (!_open) return;
             try
             {
-                _drawWindowCached ??= DrawWindow;
+                _windowFn ??= new Action<int>(DrawWindow);
                 _win = GUILayout.Window(0x00D3A1, _win,
-                    (GUI.WindowFunction)_drawWindowCached,
+                    (GUI.WindowFunction)_windowFn,
                     "ESM26 Dual Manager — две организации в одном мире");
             }
             catch (Exception e)
