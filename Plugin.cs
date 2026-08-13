@@ -162,104 +162,237 @@ namespace ESM26.DualManager
             if (!Resolve())
             {
                 log.LogWarning("DUMP: игровые типы не найдены.");
-                var names = new List<string>();
                 foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
-                    names.Add(asm.GetName().Name);
-                log.LogInfo("DUMP: загруженные сборки: " + string.Join(", ", names));
+                    log.LogInfo("DUMP asm: " + asm.GetName().Name);
                 return;
             }
 
-            const BindingFlags F = BindingFlags.Public | BindingFlags.NonPublic |
-                                   BindingFlags.Static | BindingFlags.Instance;
+            const BindingFlags SF = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static;
+            const BindingFlags IF = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
 
-            foreach (var t in new[] { _globalValues, _dataTeams, _dataTeam })
+            var teamType = _dataTeam;
+            log.LogInfo($"DUMP DataTeam type = {teamType?.FullName}");
+            var cur = GetPlayerTeam();
+            log.LogInfo($"DUMP playerTeam = {(cur == null ? "null" : cur.GetType().FullName)}");
+
+            int typesScanned = 0, printed = 0;
+            foreach (var t in GameTypes())
             {
-                if (t == null) continue;
+                typesScanned++;
+                var nm = t.Name;
+                bool interesting =
+                    nm.IndexOf("Team", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    nm.EndsWith("Database", StringComparison.Ordinal) ||
+                    nm == "GlobalValues";
+                if (!interesting) continue;
+                if (printed++ > 40) break;
+
                 log.LogInfo($"DUMP === {t.FullName} ===");
                 try
                 {
-                    foreach (var p in t.GetProperties(F))
-                        log.LogInfo($"DUMP   prop  {(p.GetMethod?.IsStatic == true ? "static " : "")}{p.PropertyType.Name} {p.Name}");
-                    foreach (var f in t.GetFields(F))
-                        log.LogInfo($"DUMP   field {(f.IsStatic ? "static " : "")}{f.FieldType.Name} {f.Name}");
-                }
-                catch (Exception e) { log.LogWarning($"DUMP: {t.Name}: {e.Message}"); }
-            }
+                    foreach (var m in StaticMembers(t, SF))
+                    {
+                        var mt = m is PropertyInfo pi ? pi.PropertyType : ((FieldInfo)m).FieldType;
+                        var val = SafeGet(m, null);
+                        string extra = "";
+                        if (val != null)
+                        {
+                            var probe = new List<object>();
+                            if (TryEnumerate(val, probe))
+                                extra = $"  -> коллекция, {probe.Count} шт." +
+                                        (probe.Count > 0 ? $", элемент {probe[0].GetType().Name}" : "");
+                            else extra = "  -> значение есть";
+                        }
+                        log.LogInfo($"DUMP   static {mt.Name} {m.Name}{extra}");
+                    }
 
-            // Что реально лежит в текущей команде игрока
-            var cur = GetPlayerTeam();
-            log.LogInfo($"DUMP playerTeam = {(cur == null ? "null" : cur.GetType().FullName)}");
+                    var instM = FindMember(t, "Instance", "instance", "Current", "current");
+                    var inst = instM != null ? SafeGet(instM, null) : null;
+                    if (inst != null)
+                    {
+                        log.LogInfo($"DUMP   -- Instance: {inst.GetType().Name} --");
+                        foreach (var m in InstanceMembers(inst.GetType(), IF))
+                        {
+                            var mt = m is PropertyInfo pi2 ? pi2.PropertyType : ((FieldInfo)m).FieldType;
+                            var val = SafeGet(m, inst);
+                            string extra = "";
+                            if (val != null)
+                            {
+                                var probe = new List<object>();
+                                if (TryEnumerate(val, probe))
+                                    extra = $"  -> коллекция, {probe.Count} шт." +
+                                            (probe.Count > 0 ? $", элемент {probe[0].GetType().Name}" : "");
+                            }
+                            log.LogInfo($"DUMP   inst {mt.Name} {m.Name}{extra}");
+                        }
+                    }
+                }
+                catch (Exception e) { log.LogWarning($"DUMP {t.Name}: {e.Message}"); }
+            }
+            log.LogInfo($"DUMP: типов просмотрено {typesScanned}, выведено {printed}");
         }
+
+        private static Func<List<object>> _teamsAccessor;
+        private static string _accessorDesc = "не найден";
+        public static string AccessorDescription => _accessorDesc;
 
         public static List<object> AllTeams()
         {
             var result = new List<object>();
             if (!Ready) return result;
 
-            const BindingFlags F = BindingFlags.Public | BindingFlags.NonPublic |
-                                   BindingFlags.Static | BindingFlags.Instance;
-
-            var candidates = new List<object>();
-
-            // 1. Явно известные имена на GlobalValues и DataTeams
-            foreach (var name in new[] { "DataTeams", "dataTeams", "Teams", "teams",
-                                         "AllTeams", "allTeams", "TeamsList", "teamsList" })
+            // Найденный однажды путь к списку переиспользуется.
+            if (_teamsAccessor != null)
             {
-                var m = FindMember(_globalValues, name);
-                if (m == null) continue;
-                var v = SafeGet(m, null);
-                if (v != null) candidates.Add(v);
-            }
-
-            if (_dataTeams != null)
-            {
-                foreach (var name in new[] { "Instance", "instance", "Current", "current" })
+                try
                 {
-                    var m = FindMember(_dataTeams, name);
-                    if (m == null) continue;
-                    var v = SafeGet(m, null);
-                    if (v != null) candidates.Add(v);
+                    var cached = _teamsAccessor();
+                    if (cached != null && cached.Count > 0) return cached;
                 }
-                // Статические коллекции прямо в DataTeams
-                foreach (var f in _dataTeams.GetFields(F))
-                {
-                    if (!f.IsStatic) continue;
-                    var v = SafeGet(f, null);
-                    if (v != null) candidates.Add(v);
-                }
-                foreach (var p in _dataTeams.GetProperties(F))
-                {
-                    if (p.GetMethod?.IsStatic != true) continue;
-                    var v = SafeGet(p, null);
-                    if (v != null) candidates.Add(v);
-                }
+                catch { _teamsAccessor = null; }
             }
 
-            // 2. Любые статические коллекции на GlobalValues
-            foreach (var f in _globalValues.GetFields(F))
-            {
-                if (!f.IsStatic) continue;
-                var v = SafeGet(f, null);
-                if (v != null) candidates.Add(v);
-            }
-            foreach (var p in _globalValues.GetProperties(F))
-            {
-                if (p.GetMethod?.IsStatic != true) continue;
-                var v = SafeGet(p, null);
-                if (v != null) candidates.Add(v);
-            }
+            if (FindTeamsAccessor(result)) return result;
 
-            // 3. Из каждого кандидата пробуем достать список команд
-            foreach (var c in candidates)
-            {
-                if (TryExtractTeams(c, result)) break;
-            }
-
-            if (result.Count == 0)
-                DualManagerPlugin.Logger.LogWarning(
-                    "Список организаций не найден. Нажмите клавишу дампа и пришлите лог.");
-
+            DualManagerPlugin.Logger.LogWarning(
+                "Список организаций не найден ни в одном игровом типе. " +
+                "Нажмите клавишу диагностики и пришлите лог.");
             return result;
+        }
+
+        /// <summary>
+        /// Полный обход игровых типов в поисках коллекции организаций:
+        /// сначала статические члены, затем содержимое синглтонов (Instance).
+        /// </summary>
+        private static bool FindTeamsAccessor(List<object> result)
+        {
+            const BindingFlags SF = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static;
+            const BindingFlags IF = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var log = DualManagerPlugin.Logger;
+
+            foreach (var type in GameTypes())
+            {
+                if (sw.ElapsedMilliseconds > 8000) { log.LogWarning("Поиск списка прерван по времени."); break; }
+
+                // 1. Статические поля и свойства самого типа
+                foreach (var m in StaticMembers(type, SF))
+                {
+                    var v = SafeGet(m, null);
+                    if (v == null) continue;
+
+                    var tmp = new List<object>();
+                    if (TryExtractTeams(v, tmp))
+                    {
+                        var capturedType = type; var capturedMember = m;
+                        _teamsAccessor = () =>
+                        {
+                            var list = new List<object>();
+                            var val = SafeGet(capturedMember, null);
+                            if (val != null) TryExtractTeams(val, list);
+                            return list;
+                        };
+                        _accessorDesc = $"{capturedType.Name}.{capturedMember.Name}";
+                        log.LogInfo($"Список организаций найден: {_accessorDesc} ({tmp.Count} шт.)");
+                        result.AddRange(tmp);
+                        return true;
+                    }
+                }
+
+                // 2. Синглтон: Type.Instance -> его поля и свойства
+                MemberInfo instMember = FindMember(type, "Instance", "instance", "Current", "current", "Singleton");
+                if (instMember == null) continue;
+                var inst = SafeGet(instMember, null);
+                if (inst == null) continue;
+
+                foreach (var m in InstanceMembers(inst.GetType(), IF))
+                {
+                    var v = SafeGet(m, inst);
+                    if (v == null) continue;
+
+                    var tmp = new List<object>();
+                    if (TryExtractTeams(v, tmp))
+                    {
+                        var capturedInstM = instMember; var capturedM = m; var capturedType = type;
+                        _teamsAccessor = () =>
+                        {
+                            var list = new List<object>();
+                            var i2 = SafeGet(capturedInstM, null);
+                            if (i2 == null) return list;
+                            var val = SafeGet(capturedM, i2);
+                            if (val != null) TryExtractTeams(val, list);
+                            return list;
+                        };
+                        _accessorDesc = $"{capturedType.Name}.Instance.{capturedM.Name}";
+                        log.LogInfo($"Список организаций найден: {_accessorDesc} ({tmp.Count} шт.)");
+                        result.AddRange(tmp);
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+
+        /// <summary>Игровые типы, отсортированные так, чтобы вероятные шли первыми.</summary>
+        private static List<Type> GameTypes()
+        {
+            var list = new List<Type>();
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                var n = asm.GetName().Name;
+                if (n != "Assembly-CSharp" && n != "EsportsManager" &&
+                    !n.StartsWith("Il2Cpp", StringComparison.Ordinal)) continue;
+                if (n == "Il2Cppmscorlib" || n == "Il2CppSystem.Core") continue;
+
+                try { list.AddRange(asm.GetTypes()); }
+                catch (ReflectionTypeLoadException e)
+                {
+                    foreach (var t in e.Types) if (t != null) list.Add(t);
+                }
+                catch { }
+            }
+
+            int Score(Type t)
+            {
+                var n = t.Name;
+                if (n == "DataTeams") return 0;
+                if (n.IndexOf("Team", StringComparison.OrdinalIgnoreCase) >= 0) return 1;
+                if (n.EndsWith("Database", StringComparison.Ordinal)) return 2;
+                if (n == "GlobalValues") return 3;
+                if (n.EndsWith("Manager", StringComparison.Ordinal) ||
+                    n.EndsWith("Engine", StringComparison.Ordinal)) return 4;
+                if (n.StartsWith("Data", StringComparison.Ordinal)) return 5;
+                return 9;
+            }
+            list.Sort((x, y) => Score(x).CompareTo(Score(y)));
+            return list;
+        }
+
+        private static List<MemberInfo> StaticMembers(Type t, BindingFlags f)
+        {
+            var res = new List<MemberInfo>();
+            try
+            {
+                foreach (var fi in t.GetFields(f)) res.Add(fi);
+                foreach (var pi in t.GetProperties(f))
+                    if (pi.GetIndexParameters().Length == 0 && pi.CanRead) res.Add(pi);
+            }
+            catch { }
+            return res;
+        }
+
+        private static List<MemberInfo> InstanceMembers(Type t, BindingFlags f)
+        {
+            var res = new List<MemberInfo>();
+            try
+            {
+                foreach (var fi in t.GetFields(f)) res.Add(fi);
+                foreach (var pi in t.GetProperties(f))
+                    if (pi.GetIndexParameters().Length == 0 && pi.CanRead) res.Add(pi);
+            }
+            catch { }
+            return res;
         }
 
         private static object SafeGet(MemberInfo m, object inst)
@@ -302,7 +435,7 @@ namespace ESM26.DualManager
         /// <summary>Проверяет, что коллекция похожа на список организаций.</summary>
         private static bool LooksLikeTeams(List<object> items)
         {
-            if (items.Count < 5) return false;
+            if (items.Count < 3) return false;
             var first = items[0];
             if (first == null) return false;
 
@@ -313,33 +446,126 @@ namespace ESM26.DualManager
             return tn.IndexOf("Team", StringComparison.OrdinalIgnoreCase) >= 0;
         }
 
+        /// <summary>
+        /// Перечисляет коллекцию. Учитывает, что в IL2CPP списки — это
+        /// Il2CppSystem.Collections.Generic.List&lt;T&gt; и Il2CppReferenceArray&lt;T&gt;,
+        /// которые не реализуют обычный System.Collections.IEnumerable.
+        /// </summary>
         private static bool TryEnumerate(object src, List<object> into)
         {
+            if (src == null || src is string) return false;
+            const BindingFlags F = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+            var t = src.GetType();
+
+            // Примитивы и структуры коллекциями не бывают.
+            if (t.IsPrimitive || t.IsEnum) return false;
+
+            // 1. Обычный managed IEnumerable
             try
             {
-                if (src is System.Collections.IEnumerable en && !(src is string))
+                if (src is System.Collections.IEnumerable en)
                 {
                     foreach (var x in en) if (x != null) into.Add(x);
-                    return into.Count > 0;
-                }
-                var t = src.GetType();
-                var count = FindMember(t, "Count", "count", "Length");
-                var idx = t.GetProperty("Item");
-                if (count != null && idx != null)
-                {
-                    int n = Convert.ToInt32(GetValue(count, src));
-                    for (int i = 0; i < n; i++)
-                    {
-                        var x = idx.GetValue(src, new object[] { i });
-                        if (x != null) into.Add(x);
-                    }
-                    return into.Count > 0;
+                    if (into.Count > 0) return true;
                 }
             }
-            catch (Exception e)
+            catch { into.Clear(); }
+
+            // 2. Count/Length + индексатор Item либо метод get_Item
+            try
             {
-                DualManagerPlugin.Logger.LogWarning($"Не удалось перечислить организации: {e.Message}");
+                var countM = FindMember(t, "Count", "count", "Length", "length", "Size");
+                if (countM != null)
+                {
+                    var cv = SafeGet(countM, src);
+                    if (cv != null)
+                    {
+                        int n = Convert.ToInt32(cv);
+                        if (n > 0 && n < 20000)
+                        {
+                            PropertyInfo idxProp = null;
+                            foreach (var p in t.GetProperties(F))
+                            {
+                                var ps = p.GetIndexParameters();
+                                if (ps.Length == 1 && ps[0].ParameterType == typeof(int)) { idxProp = p; break; }
+                            }
+                            MethodInfo getItem = null;
+                            if (idxProp == null)
+                            {
+                                foreach (var mi in t.GetMethods(F))
+                                {
+                                    if (mi.Name != "get_Item" && mi.Name != "Get") continue;
+                                    var ps = mi.GetParameters();
+                                    if (ps.Length == 1 && ps[0].ParameterType == typeof(int)) { getItem = mi; break; }
+                                }
+                            }
+
+                            if (idxProp != null || getItem != null)
+                            {
+                                for (int i = 0; i < n; i++)
+                                {
+                                    object x = null;
+                                    try
+                                    {
+                                        x = idxProp != null
+                                            ? idxProp.GetValue(src, new object[] { i })
+                                            : getItem.Invoke(src, new object[] { i });
+                                    }
+                                    catch { break; }
+                                    if (x != null) into.Add(x);
+                                }
+                                if (into.Count > 0) return true;
+                            }
+                        }
+                    }
+                }
             }
+            catch { into.Clear(); }
+
+            // 3. Ручной обход через GetEnumerator (работает для Il2Cpp-списков)
+            try
+            {
+                var getEnum = t.GetMethod("GetEnumerator", F, null, Type.EmptyTypes, null);
+                if (getEnum != null)
+                {
+                    var e = getEnum.Invoke(src, null);
+                    if (e != null)
+                    {
+                        var et = e.GetType();
+                        var moveNext = et.GetMethod("MoveNext", F, null, Type.EmptyTypes, null);
+                        var currentM = FindMember(et, "Current", "current");
+                        if (moveNext != null && currentM != null)
+                        {
+                            int guard = 0;
+                            while (guard++ < 20000)
+                            {
+                                object ok;
+                                try { ok = moveNext.Invoke(e, null); } catch { break; }
+                                if (!(ok is bool b) || !b) break;
+                                var x = SafeGet(currentM, e);
+                                if (x != null) into.Add(x);
+                            }
+                            if (into.Count > 0) return true;
+                        }
+                    }
+                }
+            }
+            catch { into.Clear(); }
+
+            // 4. ToArray()
+            try
+            {
+                var toArr = t.GetMethod("ToArray", F, null, Type.EmptyTypes, null);
+                if (toArr != null)
+                {
+                    var arr = toArr.Invoke(src, null);
+                    if (arr != null && !ReferenceEquals(arr, src))
+                        return TryEnumerate(arr, into);
+                }
+            }
+            catch { into.Clear(); }
+
+            into.Clear();
             return false;
         }
     }
@@ -398,7 +624,7 @@ namespace ESM26.DualManager
 
         private bool _open;
         private Vector2 _scroll;
-        private string _filter = "";
+        private string _filter = "";  // строка поиска, набирается с клавиатуры
         private Slots _slots;
         private List<object> _teams = new List<object>();
         private string _status = "";
@@ -408,6 +634,12 @@ namespace ESM26.DualManager
         private void Start()
         {
             _slots = Slots.Load();
+
+            // GUILayout вырезан из сборки игры. Unity по умолчанию гоняет для
+            // OnGUI событие Layout через инфраструктуру GUILayout — из-за этого
+            // ломается вся цепочка событий и кнопки не получают клики.
+            try { useGUILayout = false; }
+            catch (Exception e) { DualManagerPlugin.Logger.LogWarning($"useGUILayout: {e.Message}"); }
         }
 
         private void Update()
@@ -469,6 +701,25 @@ namespace ESM26.DualManager
                 {
                     if (_cursor >= 0 && _cursor < list.Count)
                         AssignTeam(GameBridge.TeamName(list[_cursor]));
+                    return;
+                }
+
+                // Набор строки поиска обычными клавишами
+                var typed = Input.inputString;
+                if (!string.IsNullOrEmpty(typed))
+                {
+                    foreach (var ch in typed)
+                    {
+                        if (ch == '\b')
+                        {
+                            if (_filter.Length > 0) _filter = _filter.Substring(0, _filter.Length - 1);
+                        }
+                        else if (ch != '\n' && ch != '\r')
+                        {
+                            _filter += ch;
+                        }
+                    }
+                    _cursor = 0;
                 }
                 return;
             }
@@ -519,8 +770,8 @@ namespace ESM26.DualManager
         {
             _teams = GameBridge.AllTeams();
             _status = _teams.Count > 0
-                ? $"Найдено организаций: {_teams.Count}"
-                : "Организации не найдены — загрузите карьеру и откройте панель снова.";
+                ? $"Найдено организаций: {_teams.Count}  (источник: {GameBridge.AccessorDescription})"
+                : "Организации не найдены. Загрузите карьеру, нажмите R. Если пусто — F9 и пришлите лог.";
         }
 
         private void SwapTurn()
@@ -674,9 +925,12 @@ namespace ESM26.DualManager
             if (_picking != 0)
             {
                 GUI.Label(new Rect(cx, cy, 220f, LH), $"Организация для менеджера {_picking}:");
-                GUI.Label(new Rect(cx + 224f, cy, 50f, LH), "Поиск:");
-                _filter = GUI.TextField(new Rect(cx + 276f, cy, 200f, LH), _filter ?? "");
-                if (GUI.Button(new Rect(cx + 484f, cy, 100f, LH), "Отмена"))
+                // GUI.TextField вырезан из сборки игры, поэтому фильтр
+                // набирается обычными клавишами и рисуется как текст.
+                GUI.Box(new Rect(cx + 224f, cy, 260f, LH), "");
+                GUI.Label(new Rect(cx + 230f, cy, 250f, LH),
+                    string.IsNullOrEmpty(_filter) ? "Поиск: (просто печатайте)" : "Поиск: " + _filter);
+                if (GUI.Button(new Rect(cx + 492f, cy, 92f, LH), "Отмена  [Esc]"))
                 { _picking = 0; _filter = ""; }
                 cy += LH + 6f;
 
