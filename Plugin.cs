@@ -22,6 +22,7 @@ namespace ESM26.DualManager
         internal static ManualLogSource Logger;
         internal static ConfigEntry<KeyCode> PanelKey;
         internal static ConfigEntry<KeyCode> SwapKey;
+        internal static ConfigEntry<KeyCode> DumpKey;
 
         public override void Load()
         {
@@ -31,6 +32,8 @@ namespace ESM26.DualManager
                 "Клавиша открытия панели Dual Manager");
             SwapKey = Config.Bind("Hotkeys", "SwapKey", KeyCode.F11,
                 "Клавиша быстрой передачи хода между менеджерами");
+            DumpKey = Config.Bind("Hotkeys", "DumpKey", KeyCode.F9,
+                "Клавиша диагностики: выводит в лог структуру игровых данных");
 
             // В IL2CPP свой MonoBehaviour нужно сначала зарегистрировать в интеропе.
             ClassInjector.RegisterTypeInIl2Cpp<DualManagerUI>();
@@ -149,42 +152,165 @@ namespace ESM26.DualManager
         }
 
         /// <summary>Список всех организаций мира.</summary>
+        /// <summary>
+        /// Пишет в лог все члены найденных игровых типов.
+        /// Нужно, чтобы определить настоящие имена полей в этой версии игры.
+        /// </summary>
+        public static void DumpMembers()
+        {
+            var log = DualManagerPlugin.Logger;
+            if (!Resolve())
+            {
+                log.LogWarning("DUMP: игровые типы не найдены.");
+                var names = new List<string>();
+                foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+                    names.Add(asm.GetName().Name);
+                log.LogInfo("DUMP: загруженные сборки: " + string.Join(", ", names));
+                return;
+            }
+
+            const BindingFlags F = BindingFlags.Public | BindingFlags.NonPublic |
+                                   BindingFlags.Static | BindingFlags.Instance;
+
+            foreach (var t in new[] { _globalValues, _dataTeams, _dataTeam })
+            {
+                if (t == null) continue;
+                log.LogInfo($"DUMP === {t.FullName} ===");
+                try
+                {
+                    foreach (var p in t.GetProperties(F))
+                        log.LogInfo($"DUMP   prop  {(p.GetMethod?.IsStatic == true ? "static " : "")}{p.PropertyType.Name} {p.Name}");
+                    foreach (var f in t.GetFields(F))
+                        log.LogInfo($"DUMP   field {(f.IsStatic ? "static " : "")}{f.FieldType.Name} {f.Name}");
+                }
+                catch (Exception e) { log.LogWarning($"DUMP: {t.Name}: {e.Message}"); }
+            }
+
+            // Что реально лежит в текущей команде игрока
+            var cur = GetPlayerTeam();
+            log.LogInfo($"DUMP playerTeam = {(cur == null ? "null" : cur.GetType().FullName)}");
+        }
+
         public static List<object> AllTeams()
         {
             var result = new List<object>();
             if (!Ready) return result;
 
-            object container = null;
+            const BindingFlags F = BindingFlags.Public | BindingFlags.NonPublic |
+                                   BindingFlags.Static | BindingFlags.Instance;
+
+            var candidates = new List<object>();
+
+            // 1. Явно известные имена на GlobalValues и DataTeams
+            foreach (var name in new[] { "DataTeams", "dataTeams", "Teams", "teams",
+                                         "AllTeams", "allTeams", "TeamsList", "teamsList" })
+            {
+                var m = FindMember(_globalValues, name);
+                if (m == null) continue;
+                var v = SafeGet(m, null);
+                if (v != null) candidates.Add(v);
+            }
 
             if (_dataTeams != null)
             {
-                var inst = FindMember(_dataTeams, "Instance", "instance", "Current");
-                container = inst != null ? GetValue(inst, null) : null;
-                if (container == null)
+                foreach (var name in new[] { "Instance", "instance", "Current", "current" })
                 {
-                    var m2 = FindMember(_globalValues, "DataTeams", "dataTeams", "Teams", "teams");
-                    container = m2 != null ? GetValue(m2, null) : null;
-                }
-            }
-            if (container == null)
-            {
-                var m3 = FindMember(_globalValues, "Teams", "teams", "AllTeams", "DataTeams", "dataTeams");
-                container = m3 != null ? GetValue(m3, null) : null;
-            }
-            if (container == null) return result;
-
-            // Сам контейнер может быть списком или содержать список внутри.
-            if (!TryEnumerate(container, result))
-            {
-                foreach (var name in new[] { "Teams", "teams", "List", "list", "Items", "items", "All", "all" })
-                {
-                    var m = FindMember(container.GetType(), name);
+                    var m = FindMember(_dataTeams, name);
                     if (m == null) continue;
-                    var inner = GetValue(m, container);
-                    if (inner != null && TryEnumerate(inner, result)) break;
+                    var v = SafeGet(m, null);
+                    if (v != null) candidates.Add(v);
+                }
+                // Статические коллекции прямо в DataTeams
+                foreach (var f in _dataTeams.GetFields(F))
+                {
+                    if (!f.IsStatic) continue;
+                    var v = SafeGet(f, null);
+                    if (v != null) candidates.Add(v);
+                }
+                foreach (var p in _dataTeams.GetProperties(F))
+                {
+                    if (p.GetMethod?.IsStatic != true) continue;
+                    var v = SafeGet(p, null);
+                    if (v != null) candidates.Add(v);
                 }
             }
+
+            // 2. Любые статические коллекции на GlobalValues
+            foreach (var f in _globalValues.GetFields(F))
+            {
+                if (!f.IsStatic) continue;
+                var v = SafeGet(f, null);
+                if (v != null) candidates.Add(v);
+            }
+            foreach (var p in _globalValues.GetProperties(F))
+            {
+                if (p.GetMethod?.IsStatic != true) continue;
+                var v = SafeGet(p, null);
+                if (v != null) candidates.Add(v);
+            }
+
+            // 3. Из каждого кандидата пробуем достать список команд
+            foreach (var c in candidates)
+            {
+                if (TryExtractTeams(c, result)) break;
+            }
+
+            if (result.Count == 0)
+                DualManagerPlugin.Logger.LogWarning(
+                    "Список организаций не найден. Нажмите клавишу дампа и пришлите лог.");
+
             return result;
+        }
+
+        private static object SafeGet(MemberInfo m, object inst)
+        {
+            try { return GetValue(m, inst); }
+            catch { return null; }
+        }
+
+        private static bool TryExtractTeams(object src, List<object> into)
+        {
+            if (src == null) return false;
+
+            var tmp = new List<object>();
+            if (TryEnumerate(src, tmp) && LooksLikeTeams(tmp))
+            {
+                into.AddRange(tmp);
+                return true;
+            }
+
+            // Список может лежать внутри объекта-контейнера
+            const BindingFlags F = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
+            var t = src.GetType();
+            foreach (var f in t.GetFields(F))
+            {
+                var v = SafeGet(f, src);
+                if (v == null) continue;
+                tmp.Clear();
+                if (TryEnumerate(v, tmp) && LooksLikeTeams(tmp)) { into.AddRange(tmp); return true; }
+            }
+            foreach (var p in t.GetProperties(F))
+            {
+                var v = SafeGet(p, src);
+                if (v == null) continue;
+                tmp.Clear();
+                if (TryEnumerate(v, tmp) && LooksLikeTeams(tmp)) { into.AddRange(tmp); return true; }
+            }
+            return false;
+        }
+
+        /// <summary>Проверяет, что коллекция похожа на список организаций.</summary>
+        private static bool LooksLikeTeams(List<object> items)
+        {
+            if (items.Count < 5) return false;
+            var first = items[0];
+            if (first == null) return false;
+
+            // Тип элемента должен совпадать с типом команды игрока
+            if (_dataTeam != null && _dataTeam.IsInstanceOfType(first)) return true;
+
+            var tn = first.GetType().Name;
+            return tn.IndexOf("Team", StringComparison.OrdinalIgnoreCase) >= 0;
         }
 
         private static bool TryEnumerate(object src, List<object> into)
@@ -277,6 +403,7 @@ namespace ESM26.DualManager
         private List<object> _teams = new List<object>();
         private string _status = "";
         private int _picking; // 0 — нет, 1 — выбираем оргу A, 2 — оргу B
+        private int _cursor;  // выделенная строка в списке (для клавиатуры)
 
         private void Start()
         {
@@ -290,16 +417,102 @@ namespace ESM26.DualManager
                 if (Input.GetKeyDown(DualManagerPlugin.PanelKey.Value))
                 {
                     _open = !_open;
+                    ApplyCursorState(_open);
                     if (_open) RefreshTeams();
                 }
 
                 if (Input.GetKeyDown(DualManagerPlugin.SwapKey.Value))
                     SwapTurn();
+
+                if (Input.GetKeyDown(DualManagerPlugin.DumpKey.Value))
+                {
+                    GameBridge.DumpMembers();
+                    _status = "Диагностика записана в BepInEx\\LogOutput.log";
+                }
+
+                if (_open) HandleKeyboard();
             }
             catch (Exception e)
             {
                 DualManagerPlugin.Logger.LogError($"Ошибка обработки клавиш: {e}");
             }
+        }
+
+        /// <summary>
+        /// Полное управление с клавиатуры — работает даже если игра
+        /// перехватывает мышь и кнопки не нажимаются.
+        /// </summary>
+        private void HandleKeyboard()
+        {
+            if (Input.GetKeyDown(KeyCode.Escape))
+            {
+                if (_picking != 0) { _picking = 0; _filter = ""; }
+                else { _open = false; ApplyCursorState(false); }
+                return;
+            }
+
+            // Выбор организации из списка
+            if (_picking != 0)
+            {
+                var list = FilteredTeams();
+
+                if (Input.GetKeyDown(KeyCode.DownArrow))
+                    _cursor = list.Count == 0 ? 0 : Mathf.Min(_cursor + 1, list.Count - 1);
+                if (Input.GetKeyDown(KeyCode.UpArrow))
+                    _cursor = Mathf.Max(_cursor - 1, 0);
+                if (Input.GetKeyDown(KeyCode.PageDown))
+                    _cursor = list.Count == 0 ? 0 : Mathf.Min(_cursor + 10, list.Count - 1);
+                if (Input.GetKeyDown(KeyCode.PageUp))
+                    _cursor = Mathf.Max(_cursor - 10, 0);
+
+                if (Input.GetKeyDown(KeyCode.Return) || Input.GetKeyDown(KeyCode.KeypadEnter))
+                {
+                    if (_cursor >= 0 && _cursor < list.Count)
+                        AssignTeam(GameBridge.TeamName(list[_cursor]));
+                }
+                return;
+            }
+
+            // Основные действия
+            if (Input.GetKeyDown(KeyCode.Alpha1)) { _picking = 1; _cursor = 0; RefreshTeams(); }
+            if (Input.GetKeyDown(KeyCode.Alpha2)) { _picking = 2; _cursor = 0; RefreshTeams(); }
+
+            if (Input.GetKeyDown(KeyCode.Q)) TakeCurrentAs(1);
+            if (Input.GetKeyDown(KeyCode.W)) TakeCurrentAs(2);
+            if (Input.GetKeyDown(KeyCode.R)) RefreshTeams();
+        }
+
+        private List<object> FilteredTeams()
+        {
+            var list = new List<object>();
+            foreach (var t in _teams)
+            {
+                var nm = GameBridge.TeamName(t);
+                if (!string.IsNullOrEmpty(_filter) &&
+                    nm.IndexOf(_filter, StringComparison.OrdinalIgnoreCase) < 0) continue;
+                list.Add(t);
+            }
+            return list;
+        }
+
+        private void AssignTeam(string nm)
+        {
+            if (_picking == 1) { _slots.OrgA = nm; _slots.Current = "A"; }
+            else if (_picking == 2) { _slots.OrgB = nm; }
+            _slots.Save();
+            _status = $"Менеджер {_picking} = {nm}";
+            _picking = 0;
+            _filter = "";
+            _cursor = 0;
+        }
+
+        private void TakeCurrentAs(int slot)
+        {
+            var nm = GameBridge.TeamName(GameBridge.GetPlayerTeam());
+            if (slot == 1) { _slots.OrgA = nm; _slots.Current = "A"; }
+            else { _slots.OrgB = nm; }
+            _slots.Save();
+            _status = $"Менеджер {slot} = {nm}";
         }
 
         private void RefreshTeams()
@@ -345,17 +558,66 @@ namespace ESM26.DualManager
             }
         }
 
+        private CursorLockMode _prevLock;
+        private bool _prevCursorVisible;
+        private bool _cursorSaved;
+        private int _eventsSeen;
+
         private void OnGUI()
         {
             if (!_open) return;
             try
             {
+                // Панель должна быть поверх интерфейса игры.
+                GUI.depth = -10000;
+
+                // Диагностика: какие события вообще доходят до панели.
+                if (_eventsSeen < 12 && Event.current != null)
+                {
+                    var t = Event.current.type;
+                    if (t == EventType.MouseDown || t == EventType.MouseUp)
+                    {
+                        _eventsSeen++;
+                        DualManagerPlugin.Logger.LogInfo(
+                            $"GUI event: {t} at {Event.current.mousePosition}");
+                    }
+                }
+
                 DrawPanel();
             }
             catch (Exception e)
             {
                 DualManagerPlugin.Logger.LogError($"Ошибка отрисовки панели: {e}");
                 _open = false;
+            }
+        }
+
+        /// <summary>Пока панель открыта, курсор должен быть свободен и виден.</summary>
+        private void ApplyCursorState(bool open)
+        {
+            try
+            {
+                if (open)
+                {
+                    if (!_cursorSaved)
+                    {
+                        _prevLock = Cursor.lockState;
+                        _prevCursorVisible = Cursor.visible;
+                        _cursorSaved = true;
+                    }
+                    Cursor.lockState = CursorLockMode.None;
+                    Cursor.visible = true;
+                }
+                else if (_cursorSaved)
+                {
+                    Cursor.lockState = _prevLock;
+                    Cursor.visible = _prevCursorVisible;
+                    _cursorSaved = false;
+                }
+            }
+            catch (Exception e)
+            {
+                DualManagerPlugin.Logger.LogWarning($"Курсор: {e.Message}");
             }
         }
 
@@ -380,7 +642,8 @@ namespace ESM26.DualManager
             var current = GameBridge.GetPlayerTeam();
             var currentName = GameBridge.TeamName(current);
 
-            GUI.Label(new Rect(cx, cy, W - 24f, LH), $"Сейчас управляете: {currentName}");
+            GUI.Label(new Rect(cx, cy, W - 24f, LH),
+                $"Сейчас управляете: {currentName}      Организаций найдено: {_teams.Count}");
             cy += LH;
             GUI.Label(new Rect(cx, cy, W - 24f, LH),
                 $"Менеджер 1: {(string.IsNullOrEmpty(_slots.OrgA) ? "не выбран" : _slots.OrgA)}"
@@ -392,23 +655,17 @@ namespace ESM26.DualManager
             cy += LH + 8f;
 
             float bw = (W - 36f) / 2f;
-            if (GUI.Button(new Rect(cx, cy, bw, BH), "Взять текущую как менеджера 1"))
-            {
-                _slots.OrgA = currentName; _slots.Current = "A"; _slots.Save();
-                _status = $"Менеджер 1 = {currentName}";
-            }
-            if (GUI.Button(new Rect(cx + bw + 12f, cy, bw, BH), "Взять текущую как менеджера 2"))
-            {
-                _slots.OrgB = currentName; _slots.Save();
-                _status = $"Менеджер 2 = {currentName}";
-            }
+            if (GUI.Button(new Rect(cx, cy, bw, BH), "Взять текущую как менеджера 1  [Q]"))
+                TakeCurrentAs(1);
+            if (GUI.Button(new Rect(cx + bw + 12f, cy, bw, BH), "Взять текущую как менеджера 2  [W]"))
+                TakeCurrentAs(2);
             cy += BH + 6f;
 
             float bw3 = (W - 48f) / 3f;
-            if (GUI.Button(new Rect(cx, cy, bw3, BH), "Выбрать оргу менеджера 1"))
-            { _picking = 1; RefreshTeams(); }
-            if (GUI.Button(new Rect(cx + bw3 + 12f, cy, bw3, BH), "Выбрать оргу менеджера 2"))
-            { _picking = 2; RefreshTeams(); }
+            if (GUI.Button(new Rect(cx, cy, bw3, BH), "Выбрать оргу менеджера 1  [1]"))
+            { _picking = 1; _cursor = 0; RefreshTeams(); }
+            if (GUI.Button(new Rect(cx + bw3 + 12f, cy, bw3, BH), "Выбрать оргу менеджера 2  [2]"))
+            { _picking = 2; _cursor = 0; RefreshTeams(); }
             if (GUI.Button(new Rect(cx + (bw3 + 12f) * 2f, cy, bw3, BH),
                     $"Передать ход ({DualManagerPlugin.SwapKey.Value})"))
                 SwapTurn();
@@ -426,14 +683,8 @@ namespace ESM26.DualManager
                 float listH = y + H - cy - 70f;
                 var listRect = new Rect(cx, cy, W - 24f, listH);
 
-                var matches = new List<object>();
-                foreach (var t in _teams)
-                {
-                    var nm = GameBridge.TeamName(t);
-                    if (!string.IsNullOrEmpty(_filter) &&
-                        nm.IndexOf(_filter, StringComparison.OrdinalIgnoreCase) < 0) continue;
-                    matches.Add(t);
-                }
+                var matches = FilteredTeams();
+                if (_cursor >= matches.Count) _cursor = Math.Max(0, matches.Count - 1);
 
                 float rowH = 24f;
                 var viewRect = new Rect(0f, 0f, W - 48f, matches.Count * rowH + 4f);
@@ -441,13 +692,15 @@ namespace ESM26.DualManager
                 for (int i = 0; i < matches.Count; i++)
                 {
                     var nm = GameBridge.TeamName(matches[i]);
-                    if (GUI.Button(new Rect(2f, i * rowH, W - 70f, rowH - 2f), nm))
+                    var r = new Rect(2f, i * rowH, W - 70f, rowH - 2f);
+                    if (i == _cursor)
                     {
-                        if (_picking == 1) { _slots.OrgA = nm; _slots.Current = "A"; }
-                        else { _slots.OrgB = nm; }
-                        _slots.Save();
-                        _status = $"Менеджер {_picking} = {nm}";
-                        _picking = 0; _filter = "";
+                        GUI.Box(r, "");
+                        nm = "> " + nm;
+                    }
+                    if (GUI.Button(r, nm))
+                    {
+                        AssignTeam(GameBridge.TeamName(matches[i]));
                         break;
                     }
                 }
@@ -458,7 +711,14 @@ namespace ESM26.DualManager
             float footY = y + H - 58f;
             GUI.Label(new Rect(cx, footY, W - 24f, LH), _status ?? "");
             GUI.Label(new Rect(cx, footY + LH, W - 130f, LH),
-                $"Панель: {DualManagerPlugin.PanelKey.Value}   |   Передача хода: {DualManagerPlugin.SwapKey.Value}");
+                _picking != 0
+                    ? "Клавиши: стрелки — выбор, Enter — назначить, Esc — отмена"
+                    : $"Клавиши: 1/2 — выбрать оргу, Q/W — взять текущую, {DualManagerPlugin.SwapKey.Value} — ход, {DualManagerPlugin.DumpKey.Value} — диагностика, Esc — закрыть");
+            if (GUI.Button(new Rect(x + W - 224f, footY + LH - 2f, 106f, BH), "Диагностика"))
+            {
+                GameBridge.DumpMembers();
+                _status = "Диагностика записана в BepInEx\\LogOutput.log";
+            }
             if (GUI.Button(new Rect(x + W - 112f, footY + LH - 2f, 100f, BH), "Закрыть"))
                 _open = false;
         }
