@@ -228,9 +228,10 @@ namespace ESM26.DualManager
         {
             var sw = System.Diagnostics.Stopwatch.StartNew();
 
+            // 1. Статические члены игровых типов
             foreach (var type in AllGameTypes())
             {
-                if (sw.ElapsedMilliseconds > 10000) break;
+                if (sw.ElapsedMilliseconds > 8000) break;
 
                 foreach (var m in Members(type, SF))
                 {
@@ -277,26 +278,206 @@ namespace ESM26.DualManager
                     }
                 }
             }
+
+            // 2. Живые компоненты сцены: GameManager, DataOrganizationList и прочие
+            //    держат данные в обычных полях, статического доступа к ним нет.
+            return ScanSceneComponents(result);
+        }
+
+        /// <summary>
+        /// Обходит компоненты Unity в сцене и ищет в их полях коллекцию организаций.
+        /// Нужно потому, что игровые контейнеры не имеют статических точек входа.
+        /// </summary>
+        internal static bool ScanSceneComponents(List<object> result)
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var log = DualManagerPlugin.Logger;
+            var seenTypes = new HashSet<string>();
+
+            List<object> comps;
+            try { comps = SceneComponents(); }
+            catch (Exception e) { log.LogWarning("Обход сцены: " + e.Message); return false; }
+
+            // Сначала самые вероятные компоненты.
+            comps.Sort((a, b) => CompScore(a).CompareTo(CompScore(b)));
+
+            foreach (var wrapper in comps)
+            {
+                if (sw.ElapsedMilliseconds > 12000) { log.LogWarning("Обход сцены прерван по времени."); break; }
+                if (wrapper == null) continue;
+
+                var wt = wrapper.GetType();
+                if (!seenTypes.Add(wt.FullName)) continue;
+
+                foreach (var m in Members(wt, IF))
+                {
+                    var v = SafeGet(m, wrapper);
+                    if (v == null) continue;
+
+                    var tmp = new List<object>();
+                    if (Extract(v, tmp))
+                    {
+                        var capturedTypeName = wt.FullName;
+                        var cm = m;
+                        _accessor = () =>
+                        {
+                            var l = new List<object>();
+                            var live = FindComponentOfType(capturedTypeName);
+                            if (live == null) return l;
+                            var val = SafeGet(cm, live);
+                            if (val != null) Extract(val, l);
+                            return l;
+                        };
+                        _accessorDesc = $"{wt.Name}.{m.Name} (сцена)";
+                        log.LogInfo($"Список организаций найден: {_accessorDesc}, {tmp.Count} шт.");
+                        result.AddRange(tmp);
+                        return true;
+                    }
+                }
+            }
             return false;
+        }
+
+        private static int CompScore(object o)
+        {
+            var n = o?.GetType().Name ?? "";
+            if (n.IndexOf("Organization", StringComparison.OrdinalIgnoreCase) >= 0) return 0;
+            if (n.IndexOf("Team", StringComparison.OrdinalIgnoreCase) >= 0) return 1;
+            if (n == "GameManager") return 2;
+            if (n.EndsWith("Database", StringComparison.Ordinal)) return 3;
+            if (n.EndsWith("Manager", StringComparison.Ordinal) ||
+                n.EndsWith("Controller", StringComparison.Ordinal)) return 4;
+            return 9;
+        }
+
+        /// <summary>Все компоненты сцены, приведённые к своим настоящим типам.</summary>
+        private static List<object> SceneComponents()
+        {
+            var res = new List<object>();
+            var byName = TypesByFullName();
+
+            var all = Resources.FindObjectsOfTypeAll(
+                Il2CppInterop.Runtime.Il2CppType.Of<MonoBehaviour>());
+            if (all == null) return res;
+
+            for (int i = 0; i < all.Length; i++)
+            {
+                var o = all[i];
+                if (o == null) continue;
+                var w = AsRealType(o, byName);
+                if (w != null) res.Add(w);
+            }
+            return res;
+        }
+
+        private static Dictionary<string, Type> _typesByName;
+
+        private static Dictionary<string, Type> TypesByFullName()
+        {
+            if (_typesByName != null) return _typesByName;
+            _typesByName = new Dictionary<string, Type>();
+            foreach (var t in AllGameTypes())
+            {
+                var fn = t.FullName;
+                if (string.IsNullOrEmpty(fn)) continue;
+                var key = fn.StartsWith("Il2Cpp", StringComparison.Ordinal) ? fn.Substring(6) : fn;
+                if (!_typesByName.ContainsKey(key)) _typesByName[key] = t;
+                if (!_typesByName.ContainsKey(fn)) _typesByName[fn] = t;
+            }
+            return _typesByName;
+        }
+
+        /// <summary>Приводит объект Unity к его настоящему управляемому типу.</summary>
+        private static object AsRealType(UnityEngine.Object o, Dictionary<string, Type> byName)
+        {
+            try
+            {
+                var native = o.GetIl2CppType();
+                var fn = native?.FullName;
+                if (string.IsNullOrEmpty(fn)) return null;
+                if (!byName.TryGetValue(fn, out var t)) return null;
+                return Activator.CreateInstance(t, o.Pointer);
+            }
+            catch { return null; }
+        }
+
+        private static object FindComponentOfType(string fullName)
+        {
+            try
+            {
+                var byName = TypesByFullName();
+                var all = Resources.FindObjectsOfTypeAll(
+                    Il2CppInterop.Runtime.Il2CppType.Of<MonoBehaviour>());
+                if (all == null) return null;
+
+                for (int i = 0; i < all.Length; i++)
+                {
+                    var o = all[i];
+                    if (o == null) continue;
+                    var w = AsRealType(o, byName);
+                    if (w != null && w.GetType().FullName == fullName) return w;
+                }
+            }
+            catch { }
+            return null;
         }
 
         private static bool Extract(object src, List<object> into)
         {
-            if (Enumerate(src, into) && LooksLikeTeams(into)) return true;
-            into.Clear();
+            return ExtractDepth(src, into, 0);
+        }
 
-            if (src == null) return false;
+        private static bool ExtractDepth(object src, List<object> into, int depth)
+        {
+            if (src == null || depth > 2) return false;
             var t = src.GetType();
             if (t.IsPrimitive || t.IsEnum || src is string) return false;
+
+            // Прямая коллекция организаций
+            if (Enumerate(src, into) && LooksLikeTeams(into)) return true;
+
+            // Словарь: организации могут быть значениями
+            if (into.Count > 0)
+            {
+                var unwrapped = UnwrapPairs(into);
+                if (unwrapped != null && LooksLikeTeams(unwrapped))
+                {
+                    into.Clear();
+                    into.AddRange(unwrapped);
+                    return true;
+                }
+            }
+            into.Clear();
+
+            if (depth >= 2) return false;
 
             foreach (var m in Members(t, IF))
             {
                 var v = SafeGet(m, src);
                 if (v == null) continue;
-                if (Enumerate(v, into) && LooksLikeTeams(into)) return true;
+                if (ExtractDepth(v, into, depth + 1)) return true;
                 into.Clear();
             }
             return false;
+        }
+
+        /// <summary>Достаёт значения из элементов вида KeyValuePair.</summary>
+        private static List<object> UnwrapPairs(List<object> items)
+        {
+            if (items.Count == 0) return null;
+            var first = items[0];
+            if (first == null) return null;
+            if (first.GetType().Name.IndexOf("KeyValuePair", StringComparison.Ordinal) < 0) return null;
+
+            var res = new List<object>();
+            foreach (var it in items)
+            {
+                if (it == null) continue;
+                var m = FindMember(it.GetType(), "Value", "value");
+                var v = SafeGet(m, it);
+                if (v != null) res.Add(v);
+            }
+            return res.Count > 0 ? res : null;
         }
 
         /// <summary>
@@ -397,10 +578,22 @@ namespace ESM26.DualManager
         private static bool LooksLikeTeams(List<object> items)
         {
             if (items.Count < 3) return false;
-            var first = items[0];
-            if (first == null) return false;
-            if (_dataTeam != null && _dataTeam.IsInstanceOfType(first)) return true;
-            return first.GetType().Name.IndexOf("Team", StringComparison.OrdinalIgnoreCase) >= 0;
+
+            // Считаем списком организаций только коллекцию именно из DataTeam.
+            // Иначе ловятся посторонние коллекции (достижения, строки, цвета).
+            int checkedCount = 0, matched = 0;
+            foreach (var it in items)
+            {
+                if (it == null) continue;
+                if (++checkedCount > 5) break;
+
+                if (_dataTeam != null)
+                {
+                    if (_dataTeam.IsInstanceOfType(it)) matched++;
+                }
+                else if (it.GetType().Name == "DataTeam") matched++;
+            }
+            return checkedCount > 0 && matched == checkedCount;
         }
 
         // ── диагностика в файл ──
@@ -458,6 +651,34 @@ namespace ESM26.DualManager
                 catch (Exception e) { sb.AppendLine("  ошибка: " + e.Message); }
                 sb.AppendLine();
             }
+
+            // Компоненты сцены: там живут GameManager, DataOrganizationList и т.п.
+            sb.AppendLine();
+            sb.AppendLine("########## КОМПОНЕНТЫ СЦЕНЫ ##########");
+            try
+            {
+                var comps = SceneComponents();
+                sb.AppendLine($"Всего компонентов: {comps.Count}");
+                var seen = new HashSet<string>();
+                int shown = 0;
+                comps.Sort((a, b) => CompScore(a).CompareTo(CompScore(b)));
+                foreach (var c in comps)
+                {
+                    var ct = c.GetType();
+                    if (!seen.Add(ct.FullName)) continue;
+                    if (CompScore(c) >= 9) continue;      // только вероятные
+                    if (shown++ > 40) { sb.AppendLine("... (обрезано)"); break; }
+
+                    sb.AppendLine($"=== [сцена] {ct.FullName} ===");
+                    foreach (var m in Members(ct, IF))
+                    {
+                        var line = Describe(m, c);
+                        if (line.EndsWith("= null", StringComparison.Ordinal)) continue;
+                        sb.AppendLine("    " + line);
+                    }
+                }
+            }
+            catch (Exception e) { sb.AppendLine("Ошибка обхода сцены: " + e); }
 
             return Save(sb);
         }
