@@ -54,6 +54,9 @@ namespace ESM26.DualManager
         private static string _accessorDesc = "не найден";
         public static string AccessorDescription => _accessorDesc;
 
+        /// <summary>Рискованный обход сцены включается пользователем вручную.</summary>
+        public static bool AllowSceneScan = false;
+
         internal const BindingFlags SF = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static;
         internal const BindingFlags IF = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance;
 
@@ -103,7 +106,8 @@ namespace ESM26.DualManager
             {
                 var n = t.Name;
                 if (n == "DataTeams") return 0;
-                if (n.IndexOf("Team", StringComparison.OrdinalIgnoreCase) >= 0) return 1;
+                if (n.IndexOf("Team", StringComparison.OrdinalIgnoreCase) >= 0 &&
+                n.IndexOf("Steam", StringComparison.OrdinalIgnoreCase) < 0) return 1;
                 if (n.EndsWith("Database", StringComparison.Ordinal)) return 2;
                 if (n == "GlobalValues") return 3;
                 if (n.EndsWith("Manager", StringComparison.Ordinal) ||
@@ -150,14 +154,26 @@ namespace ESM26.DualManager
             else if (m is FieldInfo f) f.SetValue(inst, val);
         }
 
+        /// <summary>
+        /// ТОЛЬКО поля. Свойства в IL2CPP — это вызов нативного кода игры;
+        /// на чужих объектах такой вызов может уронить процесс, и перехватить
+        /// это исключением невозможно. Поэтому при обходе читаем лишь поля.
+        /// </summary>
         internal static List<MemberInfo> Members(Type t, BindingFlags f)
         {
             var res = new List<MemberInfo>();
             try
             {
-                foreach (var fi in t.GetFields(f)) res.Add(fi);
-                foreach (var pi in t.GetProperties(f))
-                    if (pi.CanRead && pi.GetIndexParameters().Length == 0) res.Add(pi);
+                foreach (var fi in t.GetFields(f))
+                {
+                    // Служебные указатели интеропа не несут данных.
+                    var n = fi.Name;
+                    if (n.StartsWith("NativeFieldInfoPtr", StringComparison.Ordinal) ||
+                        n.StartsWith("NativeMethodInfoPtr", StringComparison.Ordinal) ||
+                        n == "Pointer" || n == "ObjectClass") continue;
+                    if (fi.FieldType == typeof(IntPtr)) continue;
+                    res.Add(fi);
+                }
             }
             catch { }
             return res;
@@ -220,7 +236,20 @@ namespace ESM26.DualManager
                 _accessor = null;
             }
 
-            Scan(result);
+            // Если прошлый поиск уронил игру, метка осталась на диске —
+            // второй раз автоматически не пробуем.
+            if (CrashMarkerExists())
+            {
+                DualManagerPlugin.Logger.LogWarning(
+                    "Прошлый поиск завершился аварийно. Удалите файл esm26_scan.lock, чтобы попробовать снова.");
+                _accessorDesc = "поиск отключён после сбоя";
+                return result;
+            }
+
+            SetCrashMarker(true);
+            try { Scan(result); }
+            finally { SetCrashMarker(false); }
+
             return result;
         }
 
@@ -231,7 +260,7 @@ namespace ESM26.DualManager
             // 1. Статические члены игровых типов
             foreach (var type in AllGameTypes())
             {
-                if (sw.ElapsedMilliseconds > 8000) break;
+                if (sw.ElapsedMilliseconds > 5000) break;
 
                 foreach (var m in Members(type, SF))
                 {
@@ -279,9 +308,135 @@ namespace ESM26.DualManager
                 }
             }
 
-            // 2. Живые компоненты сцены: GameManager, DataOrganizationList и прочие
-            //    держат данные в обычных полях, статического доступа к ним нет.
-            return ScanSceneComponents(result);
+            // 2. Обход графа от известного объекта: команда игрока почти
+            //    наверняка ссылается на турнир/лигу, где есть все остальные.
+            if (ScanFromPlayerTeam(result)) return true;
+
+            // 3. Компоненты сцены — только по явному запросу: этот обход
+            //    создаёт обёртки по указателям и может уронить игру.
+            if (AllowSceneScan) return ScanSceneComponents(result);
+            return false;
+        }
+
+        /// <summary>
+        /// Поиск в ширину от команды игрока и сегодняшних матчей.
+        /// Запоминает всю цепочку полей, чтобы потом повторить путь.
+        /// </summary>
+        private sealed class Node
+        {
+            public string RootKey;
+            public List<MemberInfo> Chain;
+            public object Value;
+            public int Depth;
+        }
+
+        private static bool ScanFromPlayerTeam(List<object> result)
+        {
+            var log = DualManagerPlugin.Logger;
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+
+            var queue = new Queue<Node>();
+
+            var pt = GetPlayerTeam();
+            if (pt != null)
+                queue.Enqueue(new Node { RootKey = "PlayerTeam", Chain = new List<MemberInfo>(), Value = pt, Depth = 0 });
+
+            var tm = FindMember(_globalValues, "TodayMatches", "_TodayMatches_k__BackingField");
+            var tmv = tm != null ? SafeGet(tm, null) : null;
+            if (tmv != null)
+                queue.Enqueue(new Node { RootKey = "TodayMatches", Chain = new List<MemberInfo>(), Value = tmv, Depth = 0 });
+
+            if (queue.Count == 0) return false;
+
+            var visited = new HashSet<object>(ReferenceComparer.Instance);
+            int examined = 0;
+
+            while (queue.Count > 0)
+            {
+                if (sw.ElapsedMilliseconds > 5000 || examined > 2500)
+                {
+                    log.LogWarning("Обход графа прерван по ограничению.");
+                    break;
+                }
+
+                var cur = queue.Dequeue();
+                var node = cur.Value;
+                if (node == null || !visited.Add(node)) continue;
+                examined++;
+                if (cur.Depth > 3) continue;
+
+                var t = node.GetType();
+                if (t.IsPrimitive || t.IsEnum || node is string) continue;
+
+                foreach (var m in Members(t, IF))
+                {
+                    var v = SafeGet(m, node);
+                    if (v == null) continue;
+
+                    var vt = v.GetType();
+                    if (vt.IsPrimitive || vt.IsEnum || v is string) continue;
+
+                    var chain = new List<MemberInfo>(cur.Chain) { m };
+
+                    var probe = new List<object>();
+                    if (Enumerate(v, probe))
+                    {
+                        var teams = LooksLikeTeams(probe) ? probe : UnwrapPairs(probe);
+                        if (teams != null && LooksLikeTeams(teams) && teams.Count >= 10)
+                        {
+                            var rootKey = cur.RootKey;
+                            var chainCopy = chain;
+                            _accessor = () => WalkChain(rootKey, chainCopy);
+                            _accessorDesc = rootKey + "." + string.Join(".", chain.ConvertAll(x => x.Name));
+                            log.LogInfo($"Список организаций найден обходом графа: {_accessorDesc}, {teams.Count} шт.");
+                            result.AddRange(teams);
+                            return true;
+                        }
+
+                        int taken = 0;
+                        foreach (var el in probe)
+                        {
+                            if (el == null || taken++ > 25) break;
+                            var et = el.GetType();
+                            if (et.IsPrimitive || et.IsEnum || el is string) continue;
+                            queue.Enqueue(new Node { RootKey = cur.RootKey, Chain = chain, Value = el, Depth = cur.Depth + 1 });
+                        }
+                        continue;
+                    }
+
+                    queue.Enqueue(new Node { RootKey = cur.RootKey, Chain = chain, Value = v, Depth = cur.Depth + 1 });
+                }
+            }
+            return false;
+        }
+
+        /// <summary>Повторяет сохранённый путь и возвращает список организаций.</summary>
+        private static List<object> WalkChain(string rootKey, List<MemberInfo> chain)
+        {
+            var list = new List<object>();
+            object cur = rootKey == "PlayerTeam"
+                ? GetPlayerTeam()
+                : SafeGet(FindMember(_globalValues, "TodayMatches", "_TodayMatches_k__BackingField"), null);
+
+            for (int i = 0; i < chain.Count && cur != null; i++)
+                cur = SafeGet(chain[i], cur);
+
+            if (cur == null) return list;
+
+            var probe = new List<object>();
+            if (Enumerate(cur, probe))
+            {
+                var teams = LooksLikeTeams(probe) ? probe : UnwrapPairs(probe);
+                if (teams != null) list.AddRange(teams);
+            }
+            return list;
+        }
+
+        private sealed class ReferenceComparer : IEqualityComparer<object>
+        {
+            public static readonly ReferenceComparer Instance = new ReferenceComparer();
+            public new bool Equals(object a, object b) => ReferenceEquals(a, b);
+            public int GetHashCode(object o) => System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(o);
         }
 
         /// <summary>
@@ -342,7 +497,8 @@ namespace ESM26.DualManager
         {
             var n = o?.GetType().Name ?? "";
             if (n.IndexOf("Organization", StringComparison.OrdinalIgnoreCase) >= 0) return 0;
-            if (n.IndexOf("Team", StringComparison.OrdinalIgnoreCase) >= 0) return 1;
+            if (n.IndexOf("Team", StringComparison.OrdinalIgnoreCase) >= 0 &&
+                n.IndexOf("Steam", StringComparison.OrdinalIgnoreCase) < 0) return 1;
             if (n == "GameManager") return 2;
             if (n.EndsWith("Database", StringComparison.Ordinal)) return 3;
             if (n.EndsWith("Manager", StringComparison.Ordinal) ||
@@ -596,6 +752,28 @@ namespace ESM26.DualManager
             return checkedCount > 0 && matched == checkedCount;
         }
 
+        // ── защита от повторного падения ──
+
+        private static string MarkerPath() => Path.Combine(Paths.ConfigPath, "esm26_scan.lock");
+
+        internal static bool CrashMarkerExists()
+        {
+            try { return File.Exists(MarkerPath()); }
+            catch { return false; }
+        }
+
+        internal static void SetCrashMarker(bool on)
+        {
+            try
+            {
+                if (on) File.WriteAllText(MarkerPath(), DateTime.Now.ToString());
+                else if (File.Exists(MarkerPath())) File.Delete(MarkerPath());
+            }
+            catch { }
+        }
+
+        internal static void ClearCrashMarker() => SetCrashMarker(false);
+
         // ── диагностика в файл ──
 
         public static string WriteDump()
@@ -626,10 +804,15 @@ namespace ESM26.DualManager
             foreach (var t in AllGameTypes())
             {
                 var n = t.Name;
+                // "Steam" содержит "team" — такие типы отсеиваем.
+                bool teamish = n.IndexOf("Team", StringComparison.OrdinalIgnoreCase) >= 0 &&
+                               n.IndexOf("Steam", StringComparison.OrdinalIgnoreCase) < 0;
                 bool interesting =
-                    n.IndexOf("Team", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                    n.EndsWith("Database", StringComparison.Ordinal) ||
-                    n == "GlobalValues";
+                    teamish ||
+                    n.IndexOf("Organization", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    n.IndexOf("Database", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    n == "GlobalValues" || n == "GameManager" ||
+                    n == "SlotData" || n == "SlotController";
                 if (!interesting) continue;
                 if (printed++ > 60) { sb.AppendLine("... (обрезано)"); break; }
 
@@ -651,6 +834,26 @@ namespace ESM26.DualManager
                 catch (Exception e) { sb.AppendLine("  ошибка: " + e.Message); }
                 sb.AppendLine();
             }
+
+            // Все поля команды игрока — оттуда идёт обход графа.
+            sb.AppendLine();
+            sb.AppendLine("########## ПОЛЯ КОМАНДЫ ИГРОКА ##########");
+            try
+            {
+                var pt = GetPlayerTeam();
+                if (pt == null) sb.AppendLine("команда игрока = null");
+                else
+                {
+                    sb.AppendLine($"тип: {pt.GetType().FullName}");
+                    foreach (var m in Members(pt.GetType(), IF))
+                    {
+                        var line = Describe(m, pt);
+                        if (line.EndsWith("= null", StringComparison.Ordinal)) continue;
+                        sb.AppendLine("    " + line);
+                    }
+                }
+            }
+            catch (Exception e) { sb.AppendLine("ошибка: " + e.Message); }
 
             // Компоненты сцены: там живут GameManager, DataOrganizationList и т.п.
             sb.AppendLine();
@@ -782,7 +985,6 @@ namespace ESM26.DualManager
                 if (Input.GetKeyDown(DualManagerPlugin.PanelKey.Value))
                 {
                     _open = !_open;
-                    if (_open && _teams.Count == 0) Refresh();
                 }
 
                 if (Input.GetKeyDown(DualManagerPlugin.SwapKey.Value)) SwapTurn();
@@ -835,11 +1037,30 @@ namespace ESM26.DualManager
                 return;
             }
 
-            if (Input.GetKeyDown(KeyCode.Alpha1)) { _picking = 1; _cursor = 0; _scrollTop = 0; _filter = ""; Refresh(); }
-            if (Input.GetKeyDown(KeyCode.Alpha2)) { _picking = 2; _cursor = 0; _scrollTop = 0; _filter = ""; Refresh(); }
+            if (Input.GetKeyDown(KeyCode.Alpha1)) { _picking = 1; _cursor = 0; _scrollTop = 0; _filter = ""; if (_teams.Count == 0) Refresh(); }
+            if (Input.GetKeyDown(KeyCode.Alpha2)) { _picking = 2; _cursor = 0; _scrollTop = 0; _filter = ""; if (_teams.Count == 0) Refresh(); }
             if (Input.GetKeyDown(KeyCode.Q)) TakeCurrent(1);
             if (Input.GetKeyDown(KeyCode.W)) TakeCurrent(2);
-            if (Input.GetKeyDown(KeyCode.R)) Refresh();
+
+            if (Input.GetKeyDown(KeyCode.R))
+            {
+                GameBridge.AllowSceneScan = false;
+                Refresh();
+            }
+
+            if (Input.GetKeyDown(KeyCode.T))
+            {
+                GameBridge.AllowSceneScan = true;
+                _status = "Расширенный поиск... (может занять время)";
+                Refresh();
+                GameBridge.AllowSceneScan = false;
+            }
+
+            if (Input.GetKeyDown(KeyCode.U))
+            {
+                GameBridge.ClearCrashMarker();
+                _status = "Блокировка снята — можно искать снова (R).";
+            }
         }
 
         private void Move(int delta, int count)
@@ -866,9 +1087,12 @@ namespace ESM26.DualManager
         private void Refresh()
         {
             _teams = GameBridge.AllTeams();
-            _status = _teams.Count > 0
-                ? $"Организаций: {_teams.Count} (источник: {GameBridge.AccessorDescription})"
-                : "Список организаций не найден — нажмите F9, файл esm26_dump.txt появится в BepInEx\\config";
+            if (_teams.Count > 0)
+                _status = $"Организаций: {_teams.Count} (источник: {GameBridge.AccessorDescription})";
+            else if (GameBridge.CrashMarkerExists())
+                _status = "Поиск заблокирован после сбоя. Нажмите U, затем R.";
+            else
+                _status = "Не найдено. Попробуйте T (расширенный поиск), затем F9 для диагностики.";
         }
 
         private void Assign(string nm)
@@ -972,7 +1196,8 @@ namespace ESM26.DualManager
                 Label(x, y, w, "[1] выбрать организацию менеджера 1"); y += LH;
                 Label(x, y, w, "[2] выбрать организацию менеджера 2"); y += LH;
                 Label(x, y, w, "[Q] / [W] назначить текущую как менеджера 1 / 2"); y += LH;
-                Label(x, y, w, $"[{DualManagerPlugin.SwapKey.Value}] передать ход   [R] обновить список"); y += LH;
+                Label(x, y, w, $"[{DualManagerPlugin.SwapKey.Value}] передать ход   [R] найти организации"); y += LH;
+                Label(x, y, w, "[T] расширенный поиск (риск подвисания)   [U] снять блокировку"); y += LH;
                 Label(x, y, w, $"[{DualManagerPlugin.DumpKey.Value}] диагностика в файл   [Esc] закрыть"); y += LH + 6f;
             }
             else
@@ -989,7 +1214,7 @@ namespace ESM26.DualManager
                 if (list.Count == 0)
                 {
                     Label(x, y, w, _teams.Count == 0
-                        ? "Список пуст. Нажмите Esc, затем R. Если не помогло — F9."
+                        ? "Список пуст. Esc, затем R. Если пусто — T (расширенный), затем F9."
                         : "Ничего не найдено по фильтру.");
                     y += LH;
                 }
